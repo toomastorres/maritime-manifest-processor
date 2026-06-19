@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Salidas del motor (reportes generados)
+out/
+output/
+Salida*/
+
+# Manifiestos reales — NUNCA versionar datos de clientes.
+# Los únicos CSV permitidos son los sintéticos de samples/ (forzados abajo).
+*.CSV
+*.csv
+!samples/*.CSV
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
