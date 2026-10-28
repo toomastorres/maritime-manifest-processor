@@ -1,87 +1,98 @@
 """
-line_costs.py - Gastos de línea (THC / TOLL / SWEEPING) en modo híbrido.
+line_costs.py - Gastos de línea (THC, S/C alias TOLL, SWEEPING).
 
-Decisión 2 del plan: se LEEN del manifiesto (lo hace el parser) y acá se VALIDAN
-contra las tarifas esperadas de config.LineCostTariffs, registrando flags de
-discrepancia para revisión humana (no se sobreescriben los importes).
+Modo híbrido: el motor NO recalcula los gastos, los LEE del manifiesto y los
+compara contra la tarifa fija esperada (config.LineCostTariffs). Si no coinciden
+es un error de carga de origen y se emite una alerta para la hoja REVISIÓN; el
+importe que va a la planilla sigue siendo el del manifiesto.
 """
 
 from collections import Counter
-from typing import List
+from typing import Iterable, List, Optional
 
 from .. import config
 from ..domain.models import BLRecord
 
 
-def detect_loose_tariff(bls: List[BLRecord],
-                        known=(18, 20),
-                        default: float = 20) -> float:
+def detect_loose_tariff(bls: Iterable[BLRecord], default: Optional[float] = None) -> float:
     """
-    Detecta la era de la tarifa S/C suelta (TOLL por Tn) del propio manifiesto.
+    Tarifa del S/C suelto vigente en el viaje (ej. 18.0 histórico vs 20.0 actual,
+    valores ilustrativos).
 
-    La tarifa cambió de 18 a 20 (transición ~viajes 0226); NO se puede inferir
-    del código de viaje. Pero el RATE de las líneas S/C de carga suelta (basis no
-    contenedor) en el manifiesto ES la tarifa de la era. Se toma la dominante entre
-    las tarifas conocidas; los rates distintos son errores de carga de origen
-    (van a REVISIÓN, no cuentan para la detección). Si no hay datos, `default`.
+    Se lee del propio manifiesto: es el rate más frecuente entre las líneas de
+    S/C facturadas por tonelada (basis MT). Si el manifiesto no trae ninguna,
+    se usa el default.
     """
-    c: Counter = Counter()
-    for bl in bls:
-        for cl in bl.charge_lines:
-            if cl.desc.startswith("s/c") and not cl.is_container_basis and cl.rate > 0:
-                r = round(cl.rate, 2)
-                if r in known:
-                    c[r] += 1
-    return c.most_common(1)[0][0] if c else default
+    if default is None:
+        default = config.LineCostTariffs().sc_loose_per_ton
+    rates = Counter()
+    for bl in bls or []:
+        for r in bl.sc_loose_rates:
+            rates[round(r, 2)] += 1
+    return rates.most_common(1)[0][0] if rates else default
+
+
+def has_loose_toll(bl: BLRecord) -> bool:
+    """True si el S/C del B/L se facturó por tonelada (carga suelta)."""
+    return bool(bl.sc_loose_rates)
+
+
+# Descripciones de línea que son S/C (TOLL) en el manifiesto.
+SC_LINE_KEYS = ("s/c(pod)", "s/c(pol)")
+
+
+def toll_split(bl: BLRecord):
+    """
+    Separa el TOLL del B/L por factor de facturación: (contenedor, suelto).
+
+    El S/C por contenedor se factura por unidad (basis 20/40/PU) y el suelto
+    por tonelada (basis MT). Cuando un B/L trae los dos, son cargas distintas
+    conviviendo en el mismo B/L y el negocio pide discriminarlas.
+    """
+    suelto = sum(cl.total for cl in bl.charge_lines
+                 if any(k in cl.desc for k in SC_LINE_KEYS) and cl.basis == "MT")
+    total = bl.charge("Toll").monto
+    return total - suelto, suelto
 
 
 def validate_line_costs(bl: BLRecord, tariffs: config.LineCostTariffs) -> List[str]:
-    """
-    Compara los gastos de línea del BL contra las tarifas esperadas según la
-    cantidad de contenedores/tonelaje. Devuelve mensajes de discrepancia.
-    """
-    flags: List[str] = []
-    n_ctr = bl.cargo.container_count
+    """Devuelve las discrepancias entre lo facturado y la tarifa fija."""
+    msgs: List[str] = []
     tol = tariffs.tolerance
+    n_ctr = bl.cargo.n_containers
 
-    # THC por contenedor: 100 (20') / 120 (40'). Se valida la suma 20+40.
-    thc_total = bl.thc_20.monto + bl.thc_40.monto
-    if n_ctr > 0 and thc_total > 0:
-        expected_20 = bl.thc_20.monto and tariffs.thc_20
-        # nº de unidades implícito por monto/tarifa
-        if bl.thc_20.monto > 0 and abs((bl.thc_20.monto % tariffs.thc_20)) > tol \
-                and abs((bl.thc_20.monto % tariffs.thc_20) - tariffs.thc_20) > tol:
-            flags.append(
-                f"{bl.bl_no}: THC 20' {bl.thc_20.monto} no es múltiplo de {tariffs.thc_20}"
-            )
-        if bl.thc_40.monto > 0 and abs((bl.thc_40.monto % tariffs.thc_40)) > tol \
-                and abs((bl.thc_40.monto % tariffs.thc_40) - tariffs.thc_40) > tol:
-            flags.append(
-                f"{bl.bl_no}: THC 40' {bl.thc_40.monto} no es múltiplo de {tariffs.thc_40}"
-            )
-
-    # SWEEPING: 20 por contenedor.
+    # SWEEPING por contenedor (20' y 40' por igual).
     swp = bl.charge("Sweeping").monto
-    if n_ctr > 0 and swp > 0:
-        expected = n_ctr * tariffs.sweeping
-        if abs(swp - expected) > tol:
-            flags.append(
-                f"{bl.bl_no}: SWEEPING {swp} != {expected} ({n_ctr} ctr x {tariffs.sweeping})"
-            )
+    if n_ctr and swp:
+        esperado = n_ctr * tariffs.sweeping
+        if abs(swp - esperado) > tol:
+            msgs.append(
+                f"SWEEPING {swp} != {esperado} ({n_ctr} ctr x {tariffs.sweeping})")
 
-    # S/C (TOLL): tarifa FIJA. 150/contenedor (basis 20/40) y 20/Tn en
-    # carga suelta (basis MT/otro). Cualquier rate distinto = error de origen.
-    for cl in bl.charge_lines:
-        if not cl.desc.startswith("s/c"):
+    # S/C (TOLL) por contenedor. Se compara sólo la parte facturada por unidad,
+    # así el control también vale en los B/L que traen contenedor y carga suelta.
+    toll_ctr, _ = toll_split(bl)
+    if n_ctr and toll_ctr:
+        esperado = n_ctr * tariffs.sc_container
+        if abs(toll_ctr - esperado) > tol:
+            msgs.append(
+                f"TOLL {round(toll_ctr, 2)} != {esperado} "
+                f"({n_ctr} ctr x {tariffs.sc_container})")
+
+    # S/C (TOLL) suelto: el rate por tonelada tiene que ser el del viaje.
+    for rate in sorted(set(round(r, 2) for r in bl.sc_loose_rates)):
+        if abs(rate - tariffs.sc_loose_per_ton) > 0.01:
+            msgs.append(
+                f"TOLL suelto a {rate}/Tn (tarifa del viaje {tariffs.sc_loose_per_ton}/Tn)")
+
+    # THC: el importe tiene que ser un múltiplo exacto de la tarifa por tamaño.
+    for etiqueta, cargo, tarifa in (("20", bl.thc_20, tariffs.thc_20),
+                                    ("40", bl.thc_40, tariffs.thc_40)):
+        if not cargo.monto:
             continue
-        if cl.is_container_basis:
-            expected = tariffs.sc_container
-        else:
-            expected = tariffs.sc_loose_per_ton
-        if abs(cl.rate - expected) > tol:
-            flags.append(
-                f"{bl.bl_no}: TOLL rate {cl.rate} (basis {cl.basis}) != tarifa fija "
-                f"{expected} -> posible error de carga de origen"
-            )
+        unidades = cargo.monto / tarifa
+        if abs(unidades - round(unidades)) * tarifa > tol:
+            msgs.append(
+                f"THC {etiqueta} {cargo.monto} no es multiplo de {tarifa}")
 
-    return flags
+    return msgs

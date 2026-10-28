@@ -1,48 +1,70 @@
 """
-manifest.py - Parser del CSV de manifiesto marítimo.
+manifest.py - Lectura del CSV de manifiesto -> List[BLRecord].
 
-Migra parse_manifest() de manifest_processor_v3.py a una clase ManifestParser
-que produce List[BLRecord]. Conserva la lectura por líneas (decisión 4 del
-plan: reforzar sólo si los datos lo requieren) y la lógica IMPO/EXPO unificada.
+El CSV es un reporte de ancho fijo envuelto en CSV: cada fila es
+record_type,record_text,record_sort_id y el texto viene dividido en columnas
+por pipes:
+
+    0: prefijo   1: B/L No.   2: SHIPPER/CONSIGNEE/NOTIFY   3: Marks & Nos.
+    4: Description Of Goods   5: Gross Weight   6: Measurement
+    7: Charge Information     8: sufijo
+
+Reglas de lectura que evitan los "datos basura":
+  - Sólo son B/L válidos los que empiezan con S3. Los P3 (equipo vacío de la
+    línea marítima) cierran el B/L anterior y se descartan con todas sus líneas.
+  - Un bulto es sólo una línea 'N-Tipo' cuyo Tipo está en la hoja TIPOS DE
+    BULTO del catálogo. El resto de las líneas numeradas son descripción.
+    Un tipo con forma de bulto que no está en el catálogo se marca para revisión.
+  - Los Mafis son equipo: llevan la carga Bbulk encima, no son carga.
+  - El nombre de cada cargo incluye su encabezado ('Toll' + 'S/C(POD)'), así
+    el S/C del Toll no se confunde con 'Over Hght S/C' o 'Terminal S/C(POL)'.
+  - Los importes chicos vienen sin cero inicial ('.00P USD', '-.79P EUR').
 """
 
 import re
-from typing import Dict, List, Optional
+from collections import OrderedDict
+from typing import List, Optional
 
 from .. import config
-from ..domain.models import BLRecord, ChargeLine
-from ..domain.cargo import classify_description
+from ..catalog import Catalog, load_catalog
+from ..domain.models import BLRecord, CargoItem, ChargeLine, TotalLine
 
-
-# ═══════════════════════════════════════════════════════════════════════
-# PATRONES (migrados del script original)
-# ═══════════════════════════════════════════════════════════════════════
-
+# ── patrones ──────────────────────────────────────────────────────────
 BL_PATTERN = re.compile(r"(?<![A-Z0-9])S3\d{8}(?![A-Z0-9])")
 BL_PATTERN_P = re.compile(r"P3\d{8}")
 BL_START_PATTERN = re.compile(r"^\[?S3\d{8}\]?(?:\[T\])?")
 BL_GENERIC_PATTERN = re.compile(r"^[A-Z]\d{8}")
-CHARGE_PATTERN = re.compile(r"^\s*(.*?)\s{2,}.*?(-?[\d,]+\.\d{2})([PC])\s+([A-Z]{3})$")
-# Línea de cargo estructurada: DESCRIPTION FACTOR BASIS RATE TOTAL[P/C] CURR.
-# FACTOR admite ".384" (sin cero inicial) y "109.060"; BASIS es 20/40/MT/PU/...
-STRUCTURED_CHARGE = re.compile(
-    r"^\s*(?P<desc>.+?)\s+(?P<factor>[\d,]*\.\d+)\s+(?P<basis>[A-Z0-9]{1,4})\s+"
-    r"(?P<rate>-?[\d,]+\.\d{2})\s+(?P<total>-?[\d,]+\.\d{2})(?P<cond>[PC])\s+(?P<curr>[A-Z]{3})\s*$"
-)
+
+# Importe al final de una línea de cargo: '25,860.80P USD', '.00P USD', '-.79P EUR'.
+AMOUNT = re.compile(r"(-?[\d,]*\.\d{2})([PC])\s+([A-Z]{3})\s*$")
+CHARGE_DETAIL = re.compile(
+    r"\s(?P<factor>-?[\d,]*\.\d+)\s+(?P<basis>[A-Z0-9/]+)\s+(?P<rate>-?[\d,]*\.\d+)\s+"
+    r"-?[\d,]*\.\d{2}[PC]\s+[A-Z]{3}\s*$")
+PCT_OF = re.compile(r"-?[\d.]+%\s*of\s*([\d.,]+)")
 TOTAL_PATTERN = re.compile(
-    r"total\[(.*?)\]\s+(-?[\d,]+\.\d{2})\s*([PC])\s*([A-Z]{3})", re.IGNORECASE
-)
+    r"total\[(.*?)\]\s+(-?[\d,]*\.\d{2})\s*([PC])\s*([A-Z]{3})", re.IGNORECASE)
 BASIC_FRT_NEG = re.compile(
-    r"basic\s+frt\.\s+.*?(-[\d,]+\.\d{2})\s*([PC])\s*([A-Z]{3})", re.IGNORECASE
-)
-# VIN/chasis: token de 17 caracteres alfanuméricos contiguos (col Unit No. y
-# Description). Se exige >=1 letra y >=1 dígito para no capturar números o
-# códigos sueltos. Valida con alta precisión contra los manifiestos reales.
-VIN_PATTERN = re.compile(r"(?<![A-Z0-9])([A-Z0-9]{17})(?![A-Z0-9])")
+    r"basic\s+frt\.\s+.*?(-[\d,]*\.\d{2})\s*([PC])\s*([A-Z]{3})", re.IGNORECASE)
+
+# Línea de bulto: '27-New Small Van(s)', '1-40 ft. Mafi 130 Tons 2.7 M'.
+KIND_LINE = re.compile(r"^(\d+)\s*-\s*(.+?)\s*$")
+# Si una línea numerada tiene alguno de estos rasgos y no está en el catálogo,
+# es un tipo de bulto nuevo (no descripción): el B/L va a revisión.
+KIND_LIKE = re.compile(r"\((?:S|s)\)|\bft\.|\bVan\b|\bCar\(|RoRo|Mafi|UNPACKED|SKID")
+
+# Líneas de la columna de cargos que no son ni cargo ni encabezado de cargo.
+_CHARGE_SKIP = ("Charge Information", "DESCRIPTION", "Booking", "Continue")
+_NOT_HEADER = re.compile(r"R\.O\.E\.|^(Cross|TransShipment) Booking", re.IGNORECASE)
+
+# VIN de 17 posiciones (el estándar excluye I, O y Q).
+VIN_PATTERN = re.compile(r"(?<![A-Z0-9])[A-HJ-NPR-Z0-9]{17}(?![A-Z0-9])")
+
+# Encabezado de página: |ATLANTIC STAR                 :ATL0426          |
+SHIP_HEADER = re.compile(r"\|\s*([A-Z][A-Z0-9'. -]*[A-Z0-9])\s*:\s*([A-Z]{3})(\d{4})\s*\|")
 
 
-def _looks_like_vin(tok: str) -> bool:
-    return any(c.isalpha() for c in tok) and any(c.isdigit() for c in tok)
+def _f(s) -> float:
+    return float(str(s).replace(",", ""))
 
 
 def contar_pipes_y_posicion(texto: str, busqueda: str) -> int:
@@ -55,170 +77,168 @@ def contar_pipes_y_posicion(texto: str, busqueda: str) -> int:
 def extraer_puerto(linea: str, posicion: int) -> Optional[str]:
     partes = linea.split("|")
     if 0 <= posicion < len(partes):
-        p = partes[posicion].strip()
-        # Limpiar basura de truncado del origen (ej. 'CARTAGENA CO)' -> 'CARTAGENA CO')
-        p = p.rstrip(") (").strip()
-        return p
+        return partes[posicion].strip()
     return None
 
 
-class ManifestParser:
-    """Parser unificado IMPO/EXPO. Uso: ManifestParser(op_type).parse(path)."""
+def extract_ship_name(filename: str, limit: int = 400) -> Optional[str]:
+    """
+    Nombre del buque según el encabezado del propio manifiesto.
 
-    def __init__(self, op_type: str):
-        self.op_type = op_type.upper()
-        self.is_impo = self.op_type == "IMPO"
+    Evita depender del mapeo código -> nombre: cuando aparece un buque nuevo,
+    el nombre sale igual bien.
+    """
+    with open(filename, "r", encoding="latin-1") as f:
+        for i, line in enumerate(f):
+            if i > limit:
+                break
+            m = SHIP_HEADER.search(line)
+            if m:
+                return m.group(1).strip()
+    return None
 
-        thc_label = "POD" if self.is_impo else "POL"
-        self.entity_pattern = (
-            re.compile(r"CN:[\-= ]?\s*([^|]+)") if self.is_impo
-            else re.compile(r"SH[:\-]?\s*([^|]+)")
+
+# ── nombres de cargo ──────────────────────────────────────────────────
+
+def line_desc(c: str) -> str:
+    """Nombre del cargo en una línea con importe: sin importe, factor, base ni tarifa."""
+    s = AMOUNT.sub("", c).rstrip()
+    pct = re.search(r"\s-?[\d.]+%\s*of\s*[\d.,]+$", s)
+    if pct:
+        return s[:pct.start()].strip() + " (x% of y)"
+    s = re.sub(r"\s+-?[\d,]*\.\d+\s+\S+\s+-?[\d,]*\.\d+$", "", s)
+    return s.strip()
+
+
+def concept_name(header: Optional[str], desc: str) -> str:
+    """
+    Nombre completo del cargo, tal como figura en la hoja CONCEPTOS DE CARGO.
+    Algunos cargos ocupan dos líneas: el encabezado ('Toll', 'ETS+FUEL EU',
+    'Over Hght') y la línea con el importe ('S/C(POD)', 'Surcharge', 'S/C').
+    """
+    if header and (re.search(r"\d+\.\d{3}", header) or header.startswith("Charge Information")):
+        header = None
+    name = f"{header} {desc}" if header else desc
+    # El manifiesto a veces corta la palabra en dos líneas: 'Surcharge(P' + 'OL)'.
+    if header:
+        pegado = header + desc
+        if re.search(r"\((POL|POD)\)", pegado) and not re.search(r"\((POL|POD)\)", name):
+            name = pegado
+    name = " ".join(name.split())
+    if re.fullmatch(r"S/C\(PO[DL]\)", name):
+        name = "Toll " + name
+    return name
+
+
+# ── parser ────────────────────────────────────────────────────────────
+
+def parse_manifest(filename: str, op_type: str, catalog: Optional[Catalog] = None,
+                   tariffs: Optional[config.LineCostTariffs] = None) -> List[BLRecord]:
+    """Parser unificado IMPO/EXPO. Devuelve la lista de B/L válidos (S3...) del manifiesto."""
+    catalog = catalog or load_catalog()
+    tariffs = tariffs or config.LineCostTariffs()
+    is_impo = (op_type.upper() == "IMPO")
+
+    thc_label = "POD" if is_impo else "POL"
+    entity_pattern = (re.compile(r"CN:[\-= ]?\s*([^|]+)") if is_impo
+                      else re.compile(r"SH[:\-]?\s*([^|]+)"))
+    thc_detail = re.compile(
+        r"THC \(" + thc_label + r"\)\s+([\d,.]+)\s+(20|40|PU)\s+([\d,.]+)\s+"
+        r"([\d,.]+)([PC])\s+([A-Z]{3})")
+
+    all_bls: List[BLRecord] = []
+    bl_dict = {} if not is_impo else None
+    current: Optional[BLRecord] = None
+    active_bl = None
+    state = {}   # por B/L: bulto en curso, encabezado de cargo pendiente, último cargo
+
+    port_of_loading = "Nulo"
+    port_of_discharge = "Nulo"
+    next_line_ports = False
+    pos_carga = pos_descarga = -1
+    search_entity = False
+    montos_neg_frt = 0.0
+
+    def new_bl(bl_number: str) -> BLRecord:
+        return BLRecord(
+            bl_no=bl_number,
+            op_type=op_type.upper(),
+            port_of_loading=port_of_loading,
+            port_of_discharge=port_of_discharge,
         )
-        self.thc_detail = re.compile(
-            rf"THC \({thc_label}\)\s+([\d,.]+)\s+(20|40|PU)\s+([\d,.]+)\s+([\d,.]+)([PC])\s+([A-Z]{{3}})"
-        )
-        # Estado para descripciones de cargo "envueltas" (ej. "Over Hght" en una
-        # línea y " S/C  3.000 40 ... 3,000.00P EUR" en la siguiente).
-        self._pending_extra = None
 
-        if self.is_impo:
-            self.charge_key_map = {
-                "basic frt": "Basic FRT", "thc (pod)": "THC", "s/c(pod)": "Toll",
-                "sweeping": "Sweeping", "baf": "BAF",
-            }
-        else:
-            self.charge_key_map = {
-                "basic frt": "Basic FRT", "ens": "ENS", "thc (pol)": "THC",
-                "s/c(pol)": "Toll", "sweeping": "Sweeping",
-            }
+    def close_bl_impo():
+        nonlocal current, montos_neg_frt
+        if current:
+            current.negative_basic_frt = montos_neg_frt
+            all_bls.append(current)
+            current = None
+            montos_neg_frt = 0.0
 
-    # ------------------------------------------------------------------
-    def parse(self, filename: str) -> List[BLRecord]:
-        if self.is_impo:
-            return self._parse_impo(filename)
-        return self._parse_expo(filename)
+    with open(filename, "r", encoding="latin-1") as f:
+        for line in f:
+            # ── puertos del encabezado de página ──────────────────────
+            if next_line_ports:
+                pc = extraer_puerto(line, pos_carga)
+                pd_ = extraer_puerto(line, pos_descarga)
+                if pc:
+                    port_of_loading = pc
+                if pd_:
+                    port_of_discharge = pd_
+                next_line_ports = False
+                continue
 
-    # ------------------------------------------------------------------
-    def _new_bl(self, bl_number: str, pol: str, pod: str) -> BLRecord:
-        return BLRecord(bl_no=bl_number, port_of_loading=pol, port_of_discharge=pod)
+            low = line.lower()
+            if "port of loading" in low and "port of discharge" in low:
+                pos_carga = contar_pipes_y_posicion(line, "port of loading")
+                pos_descarga = contar_pipes_y_posicion(line, "port of discharge")
+                next_line_ports = True
+                continue
 
-    # ------------------------------------------------------------------
-    def _parse_impo(self, filename: str) -> List[BLRecord]:
-        all_bls: List[BLRecord] = []
-        current: Optional[BLRecord] = None
-        pol = pod = "Nulo"
-        next_line_ports = False
-        pos_carga = pos_descarga = -1
-        search_entity = False
-        montos_neg_frt = 0.0
+            parts = line.split("|")
 
-        def close_bl():
-            nonlocal current, montos_neg_frt
-            if current:
-                current.montos_negativos_basic_frt = montos_neg_frt
-                all_bls.append(current)
-                current = None
-                montos_neg_frt = 0.0
-
-        with open(filename, "r", encoding="latin-1") as f:
-            for line in f:
-                if next_line_ports:
-                    pc = extraer_puerto(line, pos_carga)
-                    pd_ = extraer_puerto(line, pos_descarga)
-                    if pc:
-                        pol = pc
-                    if pd_:
-                        pod = pd_
-                    next_line_ports = False
-                    continue
-
-                if "port of loading" in line.lower() and "port of discharge" in line.lower():
-                    pos_carga = contar_pipes_y_posicion(line, "port of loading")
-                    pos_descarga = contar_pipes_y_posicion(line, "port of discharge")
-                    next_line_ports = True
-                    continue
-
-                # Entity en línea siguiente
+            if is_impo:
                 if search_entity and current:
-                    m = self.entity_pattern.search(line)
+                    m = entity_pattern.search(line)
                     if m:
                         current.entity = m.group(1).strip()
                         search_entity = False
 
-                # P-BL cierra el BL actual
-                if BL_PATTERN_P.search(line) and current:
-                    close_bl()
+                if BL_PATTERN_P.search(line):
+                    close_bl_impo()
                     search_entity = False
                     continue
 
                 bl_match = BL_PATTERN.search(line)
                 if bl_match:
-                    close_bl()
-                    current = self._new_bl(bl_match.group(), pol, pod)
+                    close_bl_impo()
+                    current = new_bl(bl_match.group())
                     montos_neg_frt = 0.0
-                    self._pending_extra = None
-                    m = self.entity_pattern.search(line)
+                    m = entity_pattern.search(line)
                     if m:
                         current.entity = m.group(1).strip()
                         search_entity = False
                     else:
                         search_entity = True
 
-                if current is None:
-                    continue
-
-                montos_neg_frt += self._consume_line(line, current)
-
-        if current:
-            current.montos_negativos_basic_frt = montos_neg_frt
-            all_bls.append(current)
-        return consolidate_bls(all_bls)
-
-    # ------------------------------------------------------------------
-    def _parse_expo(self, filename: str) -> List[BLRecord]:
-        bl_dict: Dict[str, BLRecord] = {}
-        active_bl: Optional[str] = None
-        pol = pod = "Nulo"
-        next_line_ports = False
-        pos_carga = pos_descarga = -1
-        search_entity = False
-
-        with open(filename, "r", encoding="latin-1") as f:
-            for line in f:
-                if next_line_ports:
-                    pc = extraer_puerto(line, pos_carga)
-                    pd_ = extraer_puerto(line, pos_descarga)
-                    if pc:
-                        pol = pc
-                    if pd_:
-                        pod = pd_
-                    next_line_ports = False
-
-                if "port of loading" in line.lower() and "port of discharge" in line.lower():
-                    pos_carga = contar_pipes_y_posicion(line, "port of loading")
-                    pos_descarga = contar_pipes_y_posicion(line, "port of discharge")
-                    next_line_ports = True
-                    continue
-
-                parts = line.split("|")
+                entry = current
+            else:
                 is_new_bl = False
                 if len(parts) > 1:
                     col1 = parts[1].strip()
                     if BL_START_PATTERN.match(col1):
                         raw_bl = re.sub(r"^\[?(S3\d{8}(?:\[T\])?)\]?$", r"\1", col1)
-                        clean_bl = raw_bl.replace("[T]", "")
-                        active_bl = clean_bl
+                        active_bl = raw_bl.replace("[T]", "")
                         is_new_bl = True
-                        self._pending_extra = None
                         if active_bl not in bl_dict:
-                            bl_dict[active_bl] = self._new_bl(raw_bl, pol, pod)
-                        m = self.entity_pattern.search(line)
+                            bl_dict[active_bl] = new_bl(raw_bl)
+                        m = entity_pattern.search(line)
                         if m:
                             bl_dict[active_bl].entity = m.group(1).strip()
                             search_entity = False
                         else:
                             search_entity = True
-                    elif BL_GENERIC_PATTERN.match(col1):
+                    elif BL_PATTERN_P.match(col1.strip("[]")) or BL_GENERIC_PATTERN.match(col1.strip("[]")):
                         active_bl = None
                         search_entity = False
                         continue
@@ -229,62 +249,36 @@ class ManifestParser:
                 entry = bl_dict[active_bl]
 
                 if search_entity and not is_new_bl:
-                    m = self.entity_pattern.search(line)
+                    m = entity_pattern.search(line)
                     if m:
                         entry.entity = m.group(1).strip()
                     search_entity = False
 
-                neg = self._consume_line(line, entry)
-                entry.montos_negativos_basic_frt += neg
+            if entry is None:
+                continue
+            st = state.setdefault(id(entry), {"item": None, "hdr": None, "last": None})
 
-        return list(bl_dict.values())
+            # ── shipper / consignee / notify (columna 2) ──────────────
+            party = parts[2].strip() if len(parts) > 2 else ""
+            if party:
+                entry.party_lines.append(party)
 
-    # ------------------------------------------------------------------
-    def _consume_line(self, line: str, entry: BLRecord) -> float:
-        """
-        Procesa una línea de datos para `entry` (carga, peso, THC, totales,
-        cargos). Devuelve el monto negativo de Basic FRT detectado en la línea
-        (que el caller acumula según IMPO/EXPO).
-        """
-        parts = line.split("|")
-        neg_basic_frt = 0.0
+            # ── descripción y bultos (columna 4) ──────────────────────
+            desc_field = parts[4].strip() if len(parts) > 4 else ""
+            if desc_field:
+                entry.description_lines.append(desc_field)
+                for vin in VIN_PATTERN.findall(desc_field):
+                    if vin not in entry.vins:
+                        entry.vins.append(vin)
+                _read_kind(entry, desc_field, catalog, st)
 
-        # --- Captura de líneas de descripción (col 4) para extraer marca ---
-        if len(parts) > 4:
-            d4 = parts[4].strip()
-            if d4 and "TARE" not in d4.upper():
-                entry.description_lines.append(d4)
+            # ── medidas del bulto en curso (columnas 5 y 6) ───────────
+            if len(parts) > 6:
+                _read_measures(st["item"], parts[5].strip(), parts[6].strip())
 
-        # --- Captura de VIN/chasis (col Unit No. y col Description) ---
-        # La ubicación del VIN varía por marca (algunas en col 3, otras en col 4),
-        # pero el token de 17 chars es estable; se escanean ambas columnas.
-        for ci in (3, 4):
-            if len(parts) > ci:
-                for tok in VIN_PATTERN.findall(parts[ci]):
-                    if _looks_like_vin(tok):
-                        entry.add_vin(tok)
-
-        # --- Clasificación de carga ---
-        if len(parts) > 4:
-            desc_field = parts[4].strip()
-            if self.is_impo:
-                cargo_m = re.match(r"^(\d+)\s*-\s*(.+)$", desc_field)
-            else:
-                cargo_m = re.match(r"^(\d+)[\s-]*(.+)$", desc_field)
-            if cargo_m:
-                try:
-                    qty = int(cargo_m.group(1))
-                    desc = cargo_m.group(2).strip()
-                    classify_description(entry.cargo, qty, desc)
-                except ValueError:
-                    pass
-
-        # --- Peso (col5), salteando TARE ---
-        if len(parts) > 5:
-            desc4 = parts[4].strip().lower() if len(parts) > 4 else ""
-            if "tare" not in desc4:
-                weight_raw = parts[5].strip()
-                weight_raw = re.sub(r"[KkGgSs\s]+$", "", weight_raw).strip()
+            # ── peso bruto (columna 5), salteando líneas de TARA ──────
+            if len(parts) > 5 and "tare" not in desc_field.lower():
+                weight_raw = re.sub(r"[KkGgSs\s]+$", "", parts[5].strip()).strip()
                 weight_raw = weight_raw.replace(",", "")
                 try:
                     w = float(weight_raw)
@@ -293,182 +287,249 @@ class ManifestParser:
                 except (ValueError, TypeError):
                     pass
 
-        # --- THC detalle (20 vs 40) ---
-        thc_m = self.thc_detail.search(line)
-        if thc_m:
-            try:
-                unit = thc_m.group(2)
-                rate = float(thc_m.group(3).replace(",", ""))
-                amount = float(thc_m.group(4).replace(",", ""))
-                cond = thc_m.group(5)
-                curr = thc_m.group(6)
-                target = None
-                if unit == "20":
-                    target = entry.thc_20
-                elif unit == "40":
-                    target = entry.thc_40
-                elif unit == "PU":
-                    if abs(rate - self.tariff_thc_20) < 5:
-                        target = entry.thc_20
-                    elif abs(rate - self.tariff_thc_40) < 5:
-                        target = entry.thc_40
-                if target is not None:
-                    target.add(amount, cond, curr)
-            except ValueError:
-                pass
-
-        # --- Totales ---
-        total_m = TOTAL_PATTERN.search(line)
-        if total_m:
-            pais = total_m.group(1).strip().lower()
-            monto = float(total_m.group(2).replace(",", ""))
-            cond = total_m.group(3).upper()
-            moneda = total_m.group(4).upper()
-            if self.is_impo:
-                if pais == "buenos aires" and cond == "C":
-                    if moneda == "USD":
-                        entry.totals["Total Buenos Aires USD"] = monto
-                    elif moneda == "EUR":
-                        entry.totals["Total Buenos Aires EUR"] = monto
-            else:
-                if cond == "P":
-                    if pais == "buenos aires":
-                        entry.totals["Total Buenos Aires Monto"] = monto
-                        entry.totals["Total Buenos Aires Moneda"] = moneda
-                    elif pais == "matriz":
-                        entry.totals["Total Matriz Monto"] = monto
-                        entry.totals["Total Matriz Moneda"] = moneda
-                elif cond == "C":
-                    entry.collect.append({"Pais": pais, "Monto": monto, "Moneda": moneda})
-
-        # --- Basic FRT negativo ---
-        if "basic frt." in line.lower():
-            neg_m = BASIC_FRT_NEG.search(line)
-            if neg_m:
+            # ── THC discriminado por 20 y 40 pies ─────────────────────
+            thc_m = thc_detail.search(line)
+            if thc_m:
                 try:
-                    neg_basic_frt += float(neg_m.group(1).replace(",", ""))
+                    unit = thc_m.group(2)
+                    rate = _f(thc_m.group(3))
+                    amount = _f(thc_m.group(4))
+                    target = None
+                    if unit == "20":
+                        target = entry.thc_20
+                    elif unit == "40":
+                        target = entry.thc_40
+                    elif unit == "PU":
+                        # Sólo contenedores facturados por unidad que coinciden con
+                        # la tarifa THC 20'/40' cuando el B/L trae contenedores.
+                        if entry.cargo_items and any(it.family == "CONTENEDOR" for it in entry.cargo_items):
+                            if abs(rate - tariffs.thc_20) < 5:
+                                target = entry.thc_20
+                            elif abs(rate - tariffs.thc_40) < 5:
+                                target = entry.thc_40
+                    if target is not None:
+                        target.monto += amount
+                        target.letra = thc_m.group(5)
+                        target.moneda = thc_m.group(6)
                 except ValueError:
                     pass
 
-        # --- Descripción de cargo "envuelta": una línea sólo de texto cuyo
-        # contenido es un comisionable extra (ej. "Over Hght"); el valor llega
-        # en la línea siguiente. Se recuerda para fusionar la descripción.
-        bare = parts[-2].strip() if len(parts) >= 2 else ""
-        if bare and not STRUCTURED_CHARGE.match(bare):
-            low_bare = bare.lower().rstrip(".")
-            if any(low_bare.startswith(p) for p in config.COMMISSIONABLE_EXTRA):
-                self._pending_extra = low_bare
+            # ── totales por puerto ────────────────────────────────────
+            total_m = TOTAL_PATTERN.search(line)
+            if total_m:
+                pais = total_m.group(1).strip().lower()
+                monto = _f(total_m.group(2))
+                cond = total_m.group(3).upper()
+                moneda = total_m.group(4).upper()
+                entry.total_lines.append(
+                    TotalLine(" ".join(total_m.group(1).split()), monto, cond, moneda))
+                # 'Buenos Aires - Partner' (booking de subagente local) también se paga
+                # en Buenos Aires: es el mismo total a cobrar acá.
+                if pais.startswith("buenos aires"):
+                    pais = "buenos aires"
+                if is_impo:
+                    if pais == "buenos aires" and cond == "C":
+                        if moneda == "USD":
+                            entry.totals["Total Buenos Aires USD"] = monto
+                        elif moneda == "EUR":
+                            entry.totals["Total Buenos Aires EUR"] = monto
+                else:
+                    if cond == "P":
+                        if pais == "buenos aires":
+                            entry.totals["Total Buenos Aires Monto"] = monto
+                            entry.totals["Total Buenos Aires Moneda"] = moneda
+                        else:
+                            entry.totals["Total Casa Matriz Monto"] = monto
+                            entry.totals["Total Casa Matriz Moneda"] = moneda
+                    elif cond == "C":
+                        entry.collect.append(
+                            {"Pais": pais, "Monto": monto, "Moneda": moneda})
 
-        # --- Cargos ---
-        if any(c in line for c in ("USD", "EUR", "BRL", "GBP")):
-            charge_parts = line.split("|")
-            if len(charge_parts) >= 2:
-                charge_info = charge_parts[-2].strip()
-
-                # Captura estructurada (FACTOR/BASIS/RATE) — aditiva.
-                sc = STRUCTURED_CHARGE.match(charge_info)
-                if sc:
+            # ── Basic Frt. negativo ───────────────────────────────────
+            if "basic frt." in low:
+                neg_m = BASIC_FRT_NEG.search(line)
+                if neg_m:
                     try:
-                        desc = sc.group("desc").strip().lower().rstrip(".")
-                        # Si venía una descripción comisionable envuelta, la
-                        # anteponemos (ej. "over hght" + "s/c" -> "over hght s/c").
-                        if self._pending_extra:
-                            desc = self._pending_extra
-                            self._pending_extra = None
-                        entry.charge_lines.append(ChargeLine(
-                            desc=desc,
-                            factor=float(sc.group("factor").replace(",", "")),
-                            basis=sc.group("basis"),
-                            rate=float(sc.group("rate").replace(",", "")),
-                            total=float(sc.group("total").replace(",", "")),
-                            letra=sc.group("cond"),
-                            moneda=sc.group("curr"),
-                        ))
+                        val = _f(neg_m.group(1))
+                        if is_impo:
+                            montos_neg_frt += val
+                        else:
+                            entry.negative_basic_frt += val
                     except ValueError:
                         pass
 
-                cm = CHARGE_PATTERN.search(charge_info)
-                if cm:
-                    desc_raw = cm.group(1).strip().lower().replace(".", "")
-                    amount_str = cm.group(2).replace(",", "")
-                    letra = cm.group(3)
-                    moneda = cm.group(4)
-                    try:
-                        amount = float(amount_str)
-                        mapped_key = None
-                        for wl_key, int_key in self.charge_key_map.items():
-                            if wl_key in desc_raw or desc_raw == wl_key:
-                                mapped_key = int_key
-                                break
-                        if mapped_key:
-                            if mapped_key == "ENS":
-                                amount = config.ENS_FIXED_AMOUNT
-                            entry.charge(mapped_key).add(amount, letra, moneda)
-                        if amount < 0:
-                            for p in config.NEGATIVE_PREFIXES:
-                                if desc_raw == p or desc_raw.startswith(p + " "):
-                                    entry.total_ajustes_negativos += amount
-                                    break
-                    except ValueError:
-                        pass
+            # ── columna de cargos ─────────────────────────────────────
+            if len(parts) >= 8:
+                _read_charge_column(entry, parts[-2].strip(), st, is_impo)
 
-        return neg_basic_frt
-
-    # --- tarifas usadas en desambiguación THC PU ---
-    @property
-    def tariff_thc_20(self) -> float:
-        return config.LineCostTariffs().thc_20
-
-    @property
-    def tariff_thc_40(self) -> float:
-        return config.LineCostTariffs().thc_40
+    if is_impo:
+        close_bl_impo()
+    records = consolidar(all_bls if is_impo else list(bl_dict.values()))
+    for r in records:
+        r.rebuild_cargo()
+        r.party_id = extract_party_id(r.party_lines, "CN" if is_impo else "SH")
+    return records
 
 
-def _merge_charge(dst, src) -> None:
-    dst.monto += src.monto
-    if src.letra is not None:
-        dst.letra = src.letra
-    if src.moneda is not None:
-        dst.moneda = src.moneda
+# Inicio de cada parte en la columna SHIPPER/CONSIGNEE/NOTIFY: 'SH:', 'CN:', 'NO[1]:'.
+PARTY_START = re.compile(r"^(SH|CN|NO(?:\[\d+\])?)\s*[:\-=]")
+CUIT = re.compile(r"C\.?U\.?I\.?T\.?\D{0,12}?(?<!\d)(\d{2})[-\s.]?(\d{8})[-\s.]?(\d)(?!\d)")
+CUIT_WEIGHTS = (5, 4, 3, 2, 7, 6, 5, 4, 3, 2)
 
 
-def consolidate_bls(bls: List[BLRecord]) -> List[BLRecord]:
+def cuit_ok(digits: str) -> bool:
+    """Dígito verificador de la CUIT (módulo 11): descarta números mal leídos."""
+    if len(digits) != 11 or not digits.isdigit():
+        return False
+    resto = 11 - sum(int(d) * w for d, w in zip(digits, CUIT_WEIGHTS)) % 11
+    dv = 0 if resto == 11 else resto
+    return dv != 10 and dv == int(digits[10])
+
+
+def extract_party_id(lines: List[str], role: str) -> str:
     """
-    Consolida entradas con el mismo B/L (BL partido en varias páginas del
-    manifiesto) en un único registro, conservando el orden de primera
-    aparición. La verdad exacta muestra cada BL una sola vez.
+    CUIT de la parte pedida ('CN' en IMPO, 'SH' en EXPO), si el manifiesto lo
+    trae dentro de su bloque. El número puede venir partido en dos renglones
+    ('... / CUIT' y abajo '30711111117'). Sólo se toma si el dígito verificador
+    es correcto; si no figura o no verifica, queda vacío.
     """
-    merged: dict = {}
-    order: List[str] = []
-    for bl in bls:
-        if bl.bl_no not in merged:
-            merged[bl.bl_no] = bl
-            order.append(bl.bl_no)
-            continue
-        dst = merged[bl.bl_no]
-        for key, ch in bl.charges.items():
-            _merge_charge(dst.charge(key), ch)
-        _merge_charge(dst.thc_20, bl.thc_20)
-        _merge_charge(dst.thc_40, bl.thc_40)
-        dst.total_ajustes_negativos += bl.total_ajustes_negativos
-        dst.montos_negativos_basic_frt += bl.montos_negativos_basic_frt
-        for k, v in bl.cargo.containers.items():
-            dst.cargo.add_container(k, v)
-        for k, v in bl.cargo.vehicles.items():
-            dst.cargo.add_vehicle(k, v)
-        for k, v in bl.cargo.general.items():
-            dst.cargo.add_general(k, v)
-        dst.charge_lines.extend(bl.charge_lines)
-        for vin in bl.vins:
-            dst.add_vin(vin)
-        dst.collect.extend(bl.collect)
-        dst.totals.update(bl.totals)
-        dst.weight += bl.weight
-        if dst.entity in ("Nulo", "") and bl.entity not in ("Nulo", ""):
-            dst.entity = bl.entity
-    return [merged[k] for k in order]
+    bloque, dentro = [], False
+    for ln in lines:
+        m = PARTY_START.match(ln)
+        if m:
+            if dentro:
+                break
+            dentro = m.group(1) == role
+        if dentro:
+            bloque.append(ln)
+    for m in CUIT.finditer(" ".join(bloque).upper()):
+        if cuit_ok(m.group(1) + m.group(2) + m.group(3)):
+            return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    return ""
 
 
-def parse_manifest(filename: str, op_type: str) -> List[BLRecord]:
-    """Helper compatible con la firma del script original."""
-    return ManifestParser(op_type).parse(filename)
+def consolidar(records: List[BLRecord]) -> List[BLRecord]:
+    """Un B/L = un registro: junta los bloques repetidos del mismo número."""
+    out = OrderedDict()
+    for r in records:
+        existente = out.get(r.bl_no)
+        if existente is None:
+            out[r.bl_no] = r
+        else:
+            existente.merge(r)
+    return list(out.values())
+
+
+def _read_kind(entry: BLRecord, desc_field: str, catalog: Catalog, st: dict) -> None:
+    """Una línea 'N-Tipo' es un bulto sólo si el Tipo está en el catálogo."""
+    m = KIND_LINE.match(desc_field)
+    if not m:
+        return
+    kind = " ".join(m.group(2).split())
+    rule = catalog.kind(kind)
+    if rule is not None:
+        item = CargoItem(qty=int(m.group(1)), kind=kind, family=rule.family,
+                         equipment=rule.is_equipment)
+        entry.items.append(item)
+        st["item"] = item
+    elif KIND_LIKE.search(kind):
+        if kind not in entry.unknown_kinds:
+            entry.unknown_kinds.append(kind)
+        st["item"] = None
+
+
+def _read_measures(item: Optional[CargoItem], weight: str, measure: str) -> None:
+    if item is None:
+        return
+    wm = re.match(r"^([\d,]+\.\d+)", weight)
+    if wm and item.tn is None:
+        item.tn = _f(wm.group(1)) / 1000.0
+    cm = re.match(r"^([\d,]+\.\d+)\s*CBM", measure)
+    if cm and item.cbm is None:
+        item.cbm = _f(cm.group(1))
+    lm = re.match(r"^([\d,]+\.\d+)\s*LM", measure)
+    if lm and item.lm is None:
+        item.lm = _f(lm.group(1))
+
+
+def _read_charge_column(entry: BLRecord, c: str, st: dict, is_impo: bool) -> None:
+    """
+    Recorre la columna 'Charge Information'. Las líneas sin importe son el
+    encabezado del cargo siguiente; 'Tariff ID' identifica la cotización del
+    cargo anterior; los separadores y los totales cortan el encabezado.
+    """
+    if not c or c.startswith(_CHARGE_SKIP):
+        return
+    if c.startswith("Tariff ID"):
+        last = st["last"]
+        if last is not None and last.tariff is None:
+            last.tariff = c.split(":", 1)[1].strip()
+        return
+    if c.startswith("---") or c.startswith("Total["):
+        st["hdr"] = None
+        return
+    if AMOUNT.search(c):
+        st["last"] = _parse_charge(entry, c, st["hdr"], is_impo)
+        st["hdr"] = None
+        return
+    st["hdr"] = None if _NOT_HEADER.search(c) else c
+
+
+def _parse_charge(entry: BLRecord, c: str, header: Optional[str], is_impo: bool) -> ChargeLine:
+    m = AMOUNT.search(c)
+    amount = _f(m.group(1))
+    letra, moneda = m.group(2), m.group(3)
+    desc = line_desc(c)
+    concept = concept_name(header, desc)
+    desc_raw = desc.lower().replace(".", "")
+
+    factor = basis = rate = None
+    dm = CHARGE_DETAIL.search(c)
+    if dm:
+        try:
+            factor = _f(dm.group("factor"))
+            basis = dm.group("basis")
+            rate = _f(dm.group("rate"))
+        except ValueError:
+            factor = basis = rate = None
+    pct_of = None
+    pm = PCT_OF.search(c)
+    if pm:
+        try:
+            pct_of = _f(pm.group(1).rstrip("."))
+        except ValueError:
+            pct_of = None
+
+    cl = ChargeLine(desc=desc_raw, total=amount, letra=letra, moneda=moneda,
+                    factor=factor, basis=basis, rate=rate, concept=concept, pct_of=pct_of)
+    entry.charge_lines.append(cl)
+
+    # Columnas de gastos de línea de las biblias (TOLL, THC, SWP, BAF, ENS).
+    toll_name = "Toll S/C(POD)" if is_impo else "Toll S/C(POL)"
+    mapped_key = None
+    if "basic frt" in desc_raw:
+        mapped_key = "Basic FRT"
+    elif not is_impo and desc_raw == "ens":
+        mapped_key = "ENS"
+    elif ("thc (pod)" if is_impo else "thc (pol)") in desc_raw:
+        mapped_key = "THC"
+    elif concept == toll_name:
+        mapped_key = "Toll"
+    elif "sweeping" in desc_raw:
+        mapped_key = "Sweeping"
+    elif is_impo and "baf" in desc_raw:
+        mapped_key = "BAF"
+
+    if mapped_key:
+        monto = config.ENS_FIXED_AMOUNT if mapped_key == "ENS" else amount
+        entry.set_charge(mapped_key, monto, letra, moneda)
+        # Tarifa del S/C (TOLL) en carga suelta: se factura por tonelada (MT).
+        if mapped_key == "Toll" and basis == "MT" and rate:
+            entry.sc_loose_rates.append(rate)
+
+    if amount < 0:
+        for p in config.NEGATIVE_PREFIXES:
+            if desc_raw == p or desc_raw.startswith(p + " "):
+                entry.negative_adjustments += amount
+                break
+    return cl

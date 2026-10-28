@@ -1,20 +1,13 @@
-"""Modelo de dominio: BLRecord, Charge, CargoData y clasificación de carga."""
+"""domain - modelo de datos tipado y clasificación de carga."""
 
-from .models import BLRecord, Charge, CargoData, TotalLine
-from .cargo import (
-    classify_description,
-    cargo_category,
-    detect_brand,
-    format_cargo_output,
+from .classification import (
+    abreviar_puerto, agency_suffix, cargo_category, detect_brand,
+    detect_make, format_cargo, is_rolling, resolve_brand,
 )
+from .models import BLRecord, CargoData, CargoItem, Charge, ChargeLine, TotalLine
 
 __all__ = [
-    "BLRecord",
-    "Charge",
-    "CargoData",
-    "TotalLine",
-    "classify_description",
-    "cargo_category",
-    "detect_brand",
-    "format_cargo_output",
+    "BLRecord", "Charge", "ChargeLine", "CargoItem", "CargoData", "TotalLine",
+    "abreviar_puerto", "cargo_category", "detect_brand", "detect_make",
+    "agency_suffix", "resolve_brand", "is_rolling", "format_cargo",
 ]
